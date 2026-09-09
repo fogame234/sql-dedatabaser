@@ -1,0 +1,9 @@
+# Core
+alive-progress        # progress bars in main.py
+
+# Serverless parser (default engine) — both optional but recommended:
+sqlglot               # structural (Tier C) SQL parsing / dialect handling
+charset-normalizer    # encoding detection for non-UTF-8 dumps
+
+# Live-replay parser (--engine live) — only needed for that engine:
+# mysql-connector-python

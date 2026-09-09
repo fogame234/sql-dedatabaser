@@ -22,6 +22,23 @@ except ImportError:
 from dbparser import *
 
 
+# The name of the scratch schema that dump files are rebuilt into. Defined once so it
+# is not duplicated across the construct/filter queries.
+SCHEMA = "test"
+
+
+def _quote_identifier(identifier: str) -> str:
+    """
+    Safely quotes a MySQL identifier (table or column name) by wrapping it in
+    backticks and escaping any embedded backticks. This must be used for any
+    identifier that originates from an untrusted source (e.g. a dump file) before
+    it is interpolated into a SQL statement.
+    :param identifier: The raw identifier
+    :return: The backtick-quoted, escaped identifier
+    """
+    return "`" + identifier.replace("`", "``") + "`"
+
+
 class MySQLParserError(RuntimeError):
     """
     The error type for the MySQL source code parser.
@@ -38,8 +55,10 @@ class MySQLParserError(RuntimeError):
     FILTERING_ERROR = 8
     TOO_MANY_ERRORS = 9
 
-    def __init(self, ecode: int, data = None):
-        self.args = (ecode, data)
+    def __init__(self, ecode: int, data = None):
+        super().__init__(ecode, data)
+        self.ecode = ecode
+        self.data = data
 
     def __str__(self):
         match self.args[0]:
@@ -61,6 +80,10 @@ class MySQLParserError(RuntimeError):
                 return f"Failed to execute command on line {self.args[1][1]}: {self.args[1][0]}"
             case self.FILTERING_ERROR:
                 return f"Error encountered while filtering database: {self.args[1]}"
+            case self.TOO_MANY_ERRORS:
+                return "Too many errors were encountered while rebuilding the database"
+            case _:
+                return f"Unknown MySQLParser error (code {self.args[0]})"
 
 
 class MySQLParser(DatabaseParser):
@@ -87,10 +110,18 @@ class MySQLParser(DatabaseParser):
         if not has_native_sql_support:
             raise MySQLParserError(MySQLParserError.MISSING_NATIVE_SQL_SUPPORT)
 
+        # Validate the config up front so a malformed config gives a clear error
+        # instead of a raw KeyError deep inside initialize()/construct()
+        if 'connector_cfg' not in config:
+            raise MySQLParserError(
+                MySQLParserError.SQL_CONNECTION_FAILED, "missing config key: connector_cfg"
+            )
+
         # Initialize our attributes
         self.__reader: sql.StatementReader = None
         self.__connection: mysql.connector.CMySQLConnection or None = None
         self.config: dict = config
+        self.config.setdefault('ignore_errors', True)
 
     def initialize(self) -> bool:
         """
@@ -157,18 +188,21 @@ class MySQLParser(DatabaseParser):
         # Attempt to acquire the cursor
         try:
             cursor: MySQLCursor = self.__connection.cursor()
-        except mysql.connector.ProgrammingError or ValueError as e:
+        except (mysql.connector.ProgrammingError, ValueError) as e:
             raise MySQLParserError(MySQLParserError.CANNOT_ACQUIRE_CURSOR, e) from e
 
         # noinspection PyBroadException
         try:
             # We are initialized so select the test database which we built
-            cursor.execute("USE test")
+            cursor.execute(f"USE {_quote_identifier(SCHEMA)}")
 
             # Select all the table names that are in the test database
-            cursor.execute("SELECT table_name FROM information_schema.tables WHERE TABLE_SCHEMA = n'test'")
+            cursor.execute(
+                "SELECT table_name FROM information_schema.tables WHERE TABLE_SCHEMA = %s",
+                (SCHEMA,)
+            )
 
-            result = FilteredResults()
+            result: FilteredResults = {}
 
             # Filter our acquired table names
             # Note: The cursor object supports iteration over the results of the most recent command
@@ -183,12 +217,12 @@ class MySQLParser(DatabaseParser):
                 # Select every column name that belongs to that table and is in the test database
                 cursor.execute(
                     """
-                    SELECT column_name 
-                    FROM information_schema.columns 
-                    WHERE TABLE_NAME = %s 
-                    AND TABLE_SCHEMA = n'test'
+                    SELECT column_name
+                    FROM information_schema.columns
+                    WHERE TABLE_NAME = %s
+                    AND TABLE_SCHEMA = %s
                     """,
-                    (table, )
+                    (table, SCHEMA)
                 )
 
                 # Filter the received columns
@@ -204,34 +238,30 @@ class MySQLParser(DatabaseParser):
                 if len(columns) == 0:
                     continue
 
-                # Create an empty dictionary in our results for this table
-                result[table] = {}
-
-                # Create an empty list for each of our columns
-                for column in columns:
-                    result[table][column] = []
-
                 # Build a select string from our columns, so that we can acquire
-                # all relevant data with one command
-                select_str = columns[0]
-                if len(columns) > 1:
-                    # If we have more than one column, then we need to form a comma separated list
-                    for column in columns[1:]:
-                        select_str += f", {column}"
+                # all relevant data with one command. Table/column names come from
+                # untrusted dump files, so every identifier must be backtick-quoted
+                # (escaping embedded backticks) to avoid breakage on reserved words
+                # and identifier-level SQL injection.
+                select_str = ", ".join(_quote_identifier(column) for column in columns)
 
                 # Finish our selection command to select all the required columns
-                select = f"SELECT {select_str} FROM {table}"
+                select = f"SELECT {select_str} FROM {_quote_identifier(table)}"
                 cursor.execute(select)
 
-                # Add all of our results into their respective columns
-                # TODO: Find a more efficient way to do this/maybe a one-liner if possible
-                for results in cursor:
-                    for index, column in enumerate(columns):
-                        result[table][column].append(str(results[index]))
+                # Collect the rows for this table, preserving raw values so that a
+                # SQL NULL stays None rather than becoming the string "None".
+                table_data = TableData(columns)
+                for row in cursor:
+                    table_data.add_row(row)
+                result[table] = table_data
             return result
         except Exception as e:
             # We failed to run one of our filtering commands so jump out and let the caller handle it
             raise MySQLParserError(MySQLParserError.FILTERING_ERROR, e) from e
+        finally:
+            # Always release the cursor, even on the error path, to avoid leaking it
+            cursor.close()
 
     def construct(self, on_execute: Callable or None = None):
         """
@@ -247,43 +277,55 @@ class MySQLParser(DatabaseParser):
         # Attempt to acquire the cursor
         try:
             cursor: CursorBase = self.__connection.cursor()
-        except mysql.connector.ProgrammingError or ValueError as e:
+        except (mysql.connector.ProgrammingError, ValueError) as e:
             raise MySQLParserError(MySQLParserError.CANNOT_ACQUIRE_CURSOR, e) from e
+
+        quoted_schema = _quote_identifier(SCHEMA)
 
         # Set the SQL mode to non-strict, since databases tend to be running on older versions
         # of MySQL which aren't as strict with some types
         cursor.execute("set sql_mode=''")
 
         # Drop the existing test database if it exists, so we don't have conflicts
-        cursor.execute("drop database if exists test")
+        cursor.execute(f"drop database if exists {quoted_schema}")
 
         # Recreate the test database
-        cursor.execute("create database test")
+        cursor.execute(f"create database {quoted_schema}")
 
         # Switch to the test database we just created
-        cursor.execute("use test")
+        cursor.execute(f"use {quoted_schema}")
 
+        # Maximum number of ignored SQL errors before a file is abandoned (configurable)
+        max_errors = self.config.get('max_errors', 500)
         error_count = 0
-        # The reader provides an interator interface to get each statement from the file as needed
-        for command in self.__reader:
-            # noinspection PyBroadException
-            try:
-                # Execute the command parsed from the file
-                cursor.execute(command)
-            except Exception as e:
-                # If we encounter an exception and want to ignore errors, then continue execution
-                # but log to the user, otherwise re-raise the exception
-                if self.config['ignore_errors'] is True:
-                    error_count += 1
-                    print(f"SQL Error Ignored on line {self.__reader.line_no()}:{self.__reader.column()}: {e}")
-                    if error_count == 500:
-                        print("Maximum error count reached. Skipping to next file.")
-                        raise MySQLParserError(MySQLParserError.TOO_MANY_ERRORS)
-                else:
-                    raise MySQLParserError(MySQLParserError.EXECUTION_ERROR, (e, self.__reader.line_no())) from e
+        try:
+            # The reader provides an iterator interface to get each statement from the file as needed
+            for command in self.__reader:
+                # noinspection PyBroadException
+                try:
+                    # Execute the command parsed from the file
+                    cursor.execute(command)
+                except Exception as e:
+                    # If we encounter an exception and want to ignore errors, then continue execution
+                    # but log to the user, otherwise re-raise the exception
+                    if self.config.get('ignore_errors', True) is True:
+                        error_count += 1
+                        print(f"SQL Error Ignored on line {self.__reader.line_no()}:{self.__reader.column()}: {e}")
+                        if error_count >= max_errors:
+                            print("Maximum error count reached. Skipping to next file.")
+                            self.__connection.rollback()
+                            raise MySQLParserError(MySQLParserError.TOO_MANY_ERRORS)
+                    else:
+                        raise MySQLParserError(MySQLParserError.EXECUTION_ERROR, (e, self.__reader.line_no())) from e
 
-            # Run the callback function if it exists
-            if on_execute is not None:
-                on_execute()
+                # Run the callback function if it exists
+                if on_execute is not None:
+                    on_execute()
+
+            # Persist the rebuilt database so the data survives beyond this transaction
+            self.__connection.commit()
+        finally:
+            # Always release the cursor, even if construction fails partway through
+            cursor.close()
 
 
